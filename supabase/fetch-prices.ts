@@ -7,52 +7,35 @@ const ALPHA_VANTAGE_KEY = Deno.env.get("ALPHA_VANTAGE_KEY")!;
 
 const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
 const ALPHA_VANTAGE_BASE = "https://www.alphavantage.co/query";
-
-// CoinGecko uses its own IDs — add more if you expand your watchlist
-const CRYPTO_SYMBOL_TO_ID: Record<string, string> = {
-  BTC: "bitcoin",
-  ETH: "ethereum",
-  SOL: "solana",
-  BNB: "binancecoin",
-  ADA: "cardano",
-  XRP: "ripple",
-  DOGE: "dogecoin",
-  DOT: "polkadot",
-  MATIC: "matic-network",
-  AVAX: "avalanche-2",
-};
+const FEAR_GREED_URL = "https://api.alternative.me/fng/";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Fetch active watchlist from Supabase ---
-async function getWatchlist() {
+// --- Sleep helper ---
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// --- Fetch active assets from Supabase ---
+async function getAssets() {
   const { data, error } = await supabase
-    .from("watchlist")
+    .from("assets")
     .select("*")
     .eq("is_active", true);
 
-  if (error) throw new Error(`Failed to fetch watchlist: ${error.message}`);
+  if (error) throw new Error(`Failed to fetch assets: ${error.message}`);
 
   const crypto = data.filter((a) => a.asset_type === "crypto");
   const stocks = data.filter((a) => a.asset_type === "stock");
   return { crypto, stocks };
 }
 
-// --- Sleep helper ---
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// --- Fetch crypto prices from CoinGecko ---
+async function fetchCryptoPrices(assets: any[]) {
+  if (!assets.length) return {};
 
-// --- Fetch crypto prices from CoinGecko with retry ---
-async function fetchCryptoPrices(symbols: string[]) {
-  if (!symbols.length) return {};
-
-  const ids = symbols
-    .map((s) => CRYPTO_SYMBOL_TO_ID[s.toUpperCase()])
-    .filter(Boolean);
-
+  const ids = assets.map((a) => a.coingecko_id).filter(Boolean);
   if (!ids.length) return {};
 
-  // Use /simple/price — lighter endpoint, less likely to rate limit
-  const url = `${COINGECKO_BASE}/simple/price?ids=${ids.join(",")}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true`;
+  const url = `${COINGECKO_BASE}/coins/markets?vs_currency=usd&ids=${ids.join(",")}&price_change_percentage=24h,7d&order=market_cap_desc`;
 
   let attempts = 0;
   while (attempts < 3) {
@@ -68,35 +51,40 @@ async function fetchCryptoPrices(symbols: string[]) {
     if (!res.ok) throw new Error(`CoinGecko error: ${res.statusText}`);
 
     const data = await res.json();
-    const idToSymbol = Object.fromEntries(
-      Object.entries(CRYPTO_SYMBOL_TO_ID).map(([k, v]) => [v, k])
-    );
+
+    // Map coingecko_id back to symbol
+    const idToSymbol: Record<string, string> = {};
+    for (const asset of assets) {
+      if (asset.coingecko_id) idToSymbol[asset.coingecko_id] = asset.symbol;
+    }
 
     const results: Record<string, any> = {};
-    for (const [id, values] of Object.entries(data) as any) {
-      const symbol = idToSymbol[id];
+    for (const coin of data) {
+      const symbol = idToSymbol[coin.id];
       if (symbol) {
         results[symbol] = {
-          price_usd: values.usd,
-          change_24h: values.usd_24h_change ?? null,
-          market_cap: values.usd_market_cap ?? null,
-          volume_24h: values.usd_24h_vol ?? null,
+          price_usd: coin.current_price,
+          change_24h: coin.price_change_percentage_24h ?? null,
+          change_7d: coin.price_change_percentage_7d_in_currency ?? null,
+          market_cap: coin.market_cap ?? null,
+          volume_24h: coin.total_volume ?? null,
+          circulating_supply: coin.circulating_supply ?? null,
         };
       }
     }
     return results;
   }
 
-  throw new Error("CoinGecko failed after 3 attempts — try again in a minute");
+  throw new Error("CoinGecko failed after 3 attempts");
 }
 
-// --- Fetch stock price from Alpha Vantage (one at a time) ---
+// --- Fetch stock price from Alpha Vantage ---
 async function fetchStockPrice(symbol: string) {
   const url = `${ALPHA_VANTAGE_BASE}?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${ALPHA_VANTAGE_KEY}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Alpha Vantage error: ${res.statusText}`);
-  const data = await res.json();
 
+  const data = await res.json();
   const quote = data["Global Quote"];
   if (!quote || !quote["05. price"]) {
     console.log(`No data for stock: ${symbol}`);
@@ -110,34 +98,64 @@ async function fetchStockPrice(symbol: string) {
   return {
     price_usd: price,
     change_24h: change24h ? parseFloat(change24h.toFixed(4)) : null,
+    change_7d: null,
     market_cap: null,
     volume_24h: parseFloat(quote["06. volume"] ?? "0"),
+    circulating_supply: null,
   };
 }
 
-// --- Save price snapshot to Supabase ---
+// --- Fetch Fear & Greed index ---
+async function fetchFearGreed() {
+  const res = await fetch(FEAR_GREED_URL);
+  if (!res.ok) throw new Error(`Fear & Greed error: ${res.statusText}`);
+
+  const data = await res.json();
+  const latest = data.data?.[0];
+  if (!latest) throw new Error("No Fear & Greed data returned");
+
+  return {
+    value: parseInt(latest.value),
+    classification: latest.value_classification,
+  };
+}
+
+// --- Save price snapshot ---
 async function savePriceSnapshot(symbol: string, priceData: any) {
-  const { error } = await supabase.from("price_history").insert({
+  const { error } = await supabase.from("price_snapshots").insert({
     symbol,
     price_usd: priceData.price_usd,
     change_24h: priceData.change_24h,
+    change_7d: priceData.change_7d,
     market_cap: priceData.market_cap,
     volume_24h: priceData.volume_24h,
+    circulating_supply: priceData.circulating_supply,
     fetched_at: new Date().toISOString(),
   });
 
   if (error) console.error(`Failed to save ${symbol}: ${error.message}`);
 }
 
+// --- Save Fear & Greed snapshot ---
+async function saveFearGreed(data: { value: number; classification: string }) {
+  const { error } = await supabase.from("fear_greed").insert({
+    value: data.value,
+    classification: data.classification,
+    fetched_at: new Date().toISOString(),
+  });
+
+  if (error) console.error(`Failed to save fear & greed: ${error.message}`);
+}
+
 // --- Main handler ---
 Deno.serve(async (_req) => {
   try {
-    console.log("Starting price fetch...");
-    const { crypto, stocks } = await getWatchlist();
+    console.log("Starting market data fetch...");
+    const { crypto, stocks } = await getAssets();
 
-    // Crypto — one batch call
-    const cryptoSymbols = crypto.map((a: any) => a.symbol);
-    const cryptoPrices = await fetchCryptoPrices(cryptoSymbols);
+    // --- Crypto (batch) ---
+    console.log(`Fetching ${crypto.length} crypto assets...`);
+    const cryptoPrices = await fetchCryptoPrices(crypto);
 
     for (const asset of crypto) {
       const data = cryptoPrices[asset.symbol];
@@ -149,9 +167,9 @@ Deno.serve(async (_req) => {
       }
     }
 
-    // Stocks — one call per symbol
+    // --- Stocks (one at a time) ---
+    console.log(`Fetching ${stocks.length} stock assets...`);
     for (const asset of stocks) {
-      console.log(`Fetching ${asset.symbol}...`);
       try {
         const data = await fetchStockPrice(asset.symbol);
         if (data) {
@@ -161,9 +179,21 @@ Deno.serve(async (_req) => {
       } catch (e) {
         console.error(`✗ ${asset.symbol}: ${e}`);
       }
+      // Small delay between Alpha Vantage calls (free tier: 5 calls/min)
+      await sleep(12000);
     }
 
-    console.log("Price fetch complete.");
+    // --- Fear & Greed ---
+    console.log("Fetching Fear & Greed index...");
+    try {
+      const fearGreed = await fetchFearGreed();
+      await saveFearGreed(fearGreed);
+      console.log(`✓ Fear & Greed: ${fearGreed.value} (${fearGreed.classification})`);
+    } catch (e) {
+      console.error(`✗ Fear & Greed: ${e}`);
+    }
+
+    console.log("Market data fetch complete.");
     return new Response(JSON.stringify({ success: true }), {
       headers: { "Content-Type": "application/json" },
     });

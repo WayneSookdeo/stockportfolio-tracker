@@ -1,77 +1,116 @@
 import { supabase } from '@/lib/supabase'
-import PortfolioSummary from '@/components/PortfolioSummary'
-import AssetCard from '@/components/AssetCard'
+import MarketStats from '@/components/MarketStats'
+import FearGreed from '@/components/FearGreed'
+import AssetTable from '@/components/AssetTable'
+import TopMovers from '@/components/TopMovers'
 
 async function getLatestPrices() {
   const { data, error } = await supabase
     .from('vw_latest_prices')
     .select('*')
-
-  if (error) {
-    console.error('Error fetching prices:', error)
-    return []
-  }
+    .order('market_cap', { ascending: false, nullsFirst: false })
+  if (error) { console.error(error); return [] }
   return data
 }
 
-async function getPortfolioSummary() {
+async function getMarketStats() {
   const { data, error } = await supabase
-    .from('vw_portfolio_summary')
+    .from('vw_market_stats')
     .select('*')
     .single()
-
-  if (error) {
-    console.error('Error fetching summary:', error)
-    return null
-  }
+  if (error) { console.error(error); return null }
   return data
 }
 
+async function getTopGainers() {
+  const { data, error } = await supabase
+    .from('vw_top_gainers')
+    .select('*')
+  if (error) { console.error(error); return [] }
+  return data
+}
+
+async function getTopLosers() {
+  const { data, error } = await supabase
+    .from('vw_top_losers')
+    .select('*')
+  if (error) { console.error(error); return [] }
+  return data
+}
+
+async function getFearGreed() {
+  const { data, error } = await supabase
+    .from('fear_greed')
+    .select('*')
+    .order('fetched_at', { ascending: false })
+    .limit(1)
+    .single()
+  if (error) { console.error(error); return null }
+  return data
+}
+
+export const revalidate = 3600
+
 export default async function Home() {
-  const [prices, summary] = await Promise.all([
+  const [prices, stats, gainers, losers, fearGreed] = await Promise.all([
     getLatestPrices(),
-    getPortfolioSummary(),
+    getMarketStats(),
+    getTopGainers(),
+    getTopLosers(),
+    getFearGreed(),
   ])
 
-  const crypto = prices.filter((a) => a.asset_type === 'crypto')
-  const stocks = prices.filter((a) => a.asset_type === 'stock')
+  const crypto = prices.filter((a: any) => a.asset_type === 'crypto')
+  const stocks = prices.filter((a: any) => a.asset_type === 'stock')
 
   return (
-    <main className="min-h-screen bg-gray-950 text-white px-6 py-10">
-      <div className="max-w-5xl mx-auto space-y-10">
+    <main className="min-h-screen bg-gray-950 text-white">
 
-        {/* Header */}
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Portfolio Tracker</h1>
-          <p className="text-gray-400 mt-1 text-sm">
-            Live prices · Updated daily · Powered by CoinGecko & Alpha Vantage
-          </p>
+      {/* Top bar */}
+      <div className="border-b border-gray-800 px-6 py-4">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <div>
+            <h1 className="text-xl font-bold tracking-tight">📈 Market Dashboard</h1>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Crypto & stocks · Updated hourly
+            </p>
+          </div>
+          <span className="text-xs text-gray-600">
+            {new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+          </span>
+        </div>
+      </div>
+
+      <div className="max-w-7xl mx-auto px-6 py-8 space-y-8">
+
+        {/* Market stats + Fear & Greed */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          <div className="lg:col-span-2">
+            {stats && <MarketStats stats={stats} />}
+          </div>
+          <div>
+            {fearGreed && <FearGreed data={fearGreed} />}
+          </div>
         </div>
 
-        {/* Portfolio Summary */}
-        {summary && <PortfolioSummary summary={summary} />}
+        {/* Top movers */}
+        <TopMovers gainers={gainers} losers={losers} />
 
-        {/* Crypto */}
-        {crypto.length > 0 && (
-          <section>
-            <h2 className="text-lg font-semibold text-gray-300 mb-4">Crypto</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {crypto.map((asset) => (
-                <AssetCard key={asset.symbol} asset={asset} />
-              ))}
-            </div>
-          </section>
-        )}
+        {/* Crypto table */}
+        <section>
+          <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-widest mb-4">
+            Cryptocurrency
+          </h2>
+          <AssetTable assets={crypto} />
+        </section>
 
         {/* Stocks */}
         {stocks.length > 0 && (
           <section>
-            <h2 className="text-lg font-semibold text-gray-300 mb-4">Stocks</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {stocks.map((asset) => (
-                <AssetCard key={asset.symbol} asset={asset} />
-              ))}
-            </div>
+            <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-widest mb-4">
+              Stocks
+            </h2>
+            <AssetTable assets={stocks} />
           </section>
         )}
 
